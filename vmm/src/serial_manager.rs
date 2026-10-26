@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,7 @@ pub(crate) enum EpollDispatch {
     File = 0,
     Kill = 1,
     Socket = 2,
+    InputReady = 3,
     Unknown,
 }
 const EPOLL_EVENTS_LEN: usize = 4;
@@ -100,6 +101,7 @@ impl From<u64> for EpollDispatch {
             0 => File,
             1 => Kill,
             2 => Socket,
+            3 => InputReady,
             _ => Unknown,
         }
     }
@@ -113,6 +115,7 @@ pub(crate) struct SerialManager {
     epoll_fd: OwnedFd,
     transport: ConsoleTransport,
     kill_evt: EventFd,
+    input_ready_evt: EventFd,
     handle: Option<thread::JoinHandle<()>>,
     pty_write_out: Option<Arc<AtomicBool>>,
     socket_console: Option<SocketConsole>,
@@ -178,6 +181,21 @@ impl SerialManager {
         )
         .map_err(Error::Epoll)?;
 
+        // Signaled by the device once the guest has read all queued input.
+        let input_ready_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
+        epoll::ctl(
+            epoll_fd.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            input_ready_evt.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::InputReady as u64),
+        )
+        .map_err(Error::Epoll)?;
+        serial
+            .as_ref()
+            .lock()
+            .unwrap()
+            .set_in_buffer_empty_evt(input_ready_evt.try_clone().map_err(Error::EventFd)?);
+
         epoll::ctl(
             epoll_fd.as_raw_fd(),
             epoll::ControlOptions::EPOLL_CTL_ADD,
@@ -217,10 +235,23 @@ impl SerialManager {
             epoll_fd,
             transport,
             kill_evt,
+            input_ready_evt,
             handle: None,
             pty_write_out,
             socket_console,
         }))
+    }
+
+    // The fd that input is currently read from, if any.
+    fn input_fd(
+        transport: &ConsoleTransport,
+        socket_console: Option<&SocketConsole>,
+    ) -> Option<RawFd> {
+        match transport {
+            ConsoleTransport::Socket(_) => socket_console.and_then(|c| c.client_fd()),
+            ConsoleTransport::Pty(file) | ConsoleTransport::Tty(file) => Some(file.as_raw_fd()),
+            _ => None,
+        }
     }
 
     // This function should be called when the other end of the PTY is
@@ -268,6 +299,7 @@ impl SerialManager {
         let serial = Arc::clone(&self.serial);
         let pty_write_out = self.pty_write_out.clone();
         let mut socket_console = self.socket_console.take();
+        let input_ready_evt = self.input_ready_evt.try_clone().map_err(Error::EventFd)?;
 
         // In case of PTY, we want to be able to detect a connection on the
         // other end of the PTY. This is done by detecting there's no event
@@ -288,6 +320,8 @@ impl SerialManager {
 
                     let mut events =
                         [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+                    // Set while input is not read because the receive FIFO is full.
+                    let mut input_paused = false;
 
                     loop {
                         let num_events =
@@ -330,6 +364,7 @@ impl SerialManager {
                                     };
                                     if let Some(console) = socket_console.as_mut() {
                                         if let Some(fd) = console.client_fd() {
+                                            if !input_paused {
                                             epoll::ctl(
                                                 epoll_fd.as_raw_fd(),
                                                 epoll::ControlOptions::EPOLL_CTL_DEL,
@@ -340,6 +375,7 @@ impl SerialManager {
                                                 ),
                                             )
                                             .map_err(Error::Epoll)?;
+                                            }
                                             console
                                                 .shutdown()
                                                 .map_err(Error::ShutdownConnection)?;
@@ -359,15 +395,56 @@ impl SerialManager {
                                             )
                                             .map_err(Error::Epoll)?;
                                         }
+                                        input_paused = false;
                                     }
+                                }
+                                EpollDispatch::InputReady => {
+                                    input_ready_evt.read().map_err(Error::EventFd)?;
+                                    if input_paused
+                                        && let Some(fd) =
+                                            Self::input_fd(&transport, socket_console.as_ref())
+                                    {
+                                        epoll::ctl(
+                                            epoll_fd.as_raw_fd(),
+                                            epoll::ControlOptions::EPOLL_CTL_ADD,
+                                            fd,
+                                            epoll::Event::new(
+                                                epoll::Events::EPOLLIN,
+                                                EpollDispatch::File as u64,
+                                            ),
+                                        )
+                                        .map_err(Error::Epoll)?;
+                                    }
+                                    input_paused = false;
                                 }
                                 EpollDispatch::File => {
                                     if event.events & libc::EPOLLIN as u32 != 0 {
+                                        let capacity = serial.lock().unwrap().fifo_capacity();
+                                        if capacity == 0 {
+                                            // Leave the input with the sender until the guest reads.
+                                            if let Some(fd) =
+                                                Self::input_fd(&transport, socket_console.as_ref())
+                                            {
+                                                epoll::ctl(
+                                                    epoll_fd.as_raw_fd(),
+                                                    epoll::ControlOptions::EPOLL_CTL_DEL,
+                                                    fd,
+                                                    epoll::Event::new(
+                                                        epoll::Events::EPOLLIN,
+                                                        EpollDispatch::File as u64,
+                                                    ),
+                                                )
+                                                .map_err(Error::Epoll)?;
+                                            }
+                                            input_paused = true;
+                                            continue;
+                                        }
                                         let mut input = [0u8; 64];
+                                        let input = &mut input[..capacity.min(64)];
                                         let count = match &transport {
                                             ConsoleTransport::Socket(_) => {
                                                 if let Some(console) = socket_console.as_mut() {
-                                                    match console.read(&mut input) {
+                                                    match console.read(input) {
                                                         Ok(count) => count,
                                                         Err(e) => {
                                                             warn!(
@@ -382,7 +459,7 @@ impl SerialManager {
                                             }
                                             ConsoleTransport::Pty(file)
                                             | ConsoleTransport::Tty(file) => (&**file)
-                                                .read(&mut input)
+                                                .read(input)
                                                 .map_err(Error::ReadInput)?,
                                             _ => unreachable!(),
                                         };
