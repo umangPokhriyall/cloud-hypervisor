@@ -4,7 +4,8 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::num::Wrapping;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -46,6 +47,9 @@ const OUTPUT_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 const CONFIG_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 // File written to (input ready)
 const FILE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+
+// Most input read at once.
+const MAX_INPUT_READ: usize = 4096;
 // Console resized
 const RESIZE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 // New client on the listening socket
@@ -102,6 +106,8 @@ struct ConsoleEpollHandler {
     write_out: Option<Arc<AtomicBool>>,
     socket_console: Option<SocketConsole>,
     file_event_registered: bool,
+    // Set while input is not read because the guest has no receive buffers.
+    input_paused: bool,
 }
 
 #[derive(Clone)]
@@ -198,6 +204,7 @@ impl ConsoleEpollHandler {
             write_out,
             socket_console,
             file_event_registered: false,
+            input_paused: false,
         }
     }
 
@@ -382,7 +389,7 @@ impl ConsoleEpollHandler {
         &mut self,
         helper: &mut EpollHelper,
     ) -> result::Result<(), EpollHelperError> {
-        if self.file_event_registered {
+        if self.file_event_registered || self.input_paused {
             return Ok(());
         }
 
@@ -394,6 +401,40 @@ impl ConsoleEpollHandler {
         )?;
         self.file_event_registered = true;
 
+        Ok(())
+    }
+
+    // Whether the guest has receive buffers for new input.
+    fn can_take_input(&self) -> bool {
+        if !self.in_buffer.lock().unwrap().is_empty() {
+            return false;
+        }
+        let mem = self.mem.memory();
+        self.input_queue
+            .avail_idx(&*mem, Ordering::Acquire)
+            .is_ok_and(|idx| idx != Wrapping(self.input_queue.next_avail()))
+    }
+
+    // The fd that input is currently read from, if any.
+    fn input_fd(&self) -> Option<RawFd> {
+        match self.socket_console.as_ref() {
+            Some(console) => console.client_fd(),
+            None => self.endpoint.in_file().map(|f| f.as_raw_fd()),
+        }
+    }
+
+    // Leave the input with the sender until the guest posts receive buffers.
+    fn pause_input(&mut self, helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+        if self.input_paused {
+            return Ok(());
+        }
+        // A PTY's FILE_EVENT is one-shot and stays disarmed while paused.
+        if !self.endpoint.is_pty()
+            && let Some(fd) = self.input_fd()
+        {
+            helper.del_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
+        }
+        self.input_paused = true;
         Ok(())
     }
 }
@@ -418,6 +459,14 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                     self.signal_used_queue(0).map_err(|e| {
                         EpollHelperError::HandleEvent(anyhow!("Failed to signal used queue: {e:?}"))
                     })?;
+                }
+                if self.input_paused && self.can_take_input() {
+                    self.input_paused = false;
+                    if self.endpoint.is_pty() {
+                        self.register_file_event(helper)?;
+                    } else if let Some(fd) = self.input_fd() {
+                        helper.add_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
+                    }
                 }
             }
             OUTPUT_QUEUE_EVENT => {
@@ -461,7 +510,9 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                     (self.socket_console.as_mut(), &self.endpoint)
                 {
                     if let Some(fd) = console.client_fd() {
-                        helper.del_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
+                        if !self.input_paused {
+                            helper.del_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
+                        }
                         console.shutdown().map_err(EpollHelperError::IoError)?;
                     }
                     console
@@ -470,11 +521,14 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                     if let Some(fd) = console.client_fd() {
                         helper.add_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
                     }
+                    self.input_paused = false;
                 }
             }
             FILE_EVENT => {
-                if event.events & libc::EPOLLIN as u32 != 0 {
-                    let mut input = [0u8; 64];
+                if event.events & libc::EPOLLIN as u32 != 0 && !self.can_take_input() {
+                    self.pause_input(helper)?;
+                } else if event.events & libc::EPOLLIN as u32 != 0 {
+                    let mut input = [0u8; MAX_INPUT_READ];
                     let count = if let Some(console) = self.socket_console.as_mut() {
                         console.read(&mut input).unwrap_or_else(|e| {
                             warn!("Failed to read console input: {e}");
@@ -500,6 +554,9 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                                 "Failed to signal used queue: {e:?}"
                             ))
                         })?;
+                    }
+                    if !self.can_take_input() {
+                        self.pause_input(helper)?;
                     }
                 }
                 if self.endpoint.is_pty() {
