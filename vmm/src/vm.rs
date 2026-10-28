@@ -2677,6 +2677,15 @@ impl Vm {
         self.device_manager.lock().unwrap().device_tree()
     }
 
+    /// Acquire the advisory locks for all disk images again.
+    pub fn try_lock_disks(&self) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .try_lock_disks()
+            .map_err(Error::LockingError)
+    }
+
     /// Release all advisory locks held for the disk images.
     ///
     /// This should only be called when the VM is stopped and the VMM supposed

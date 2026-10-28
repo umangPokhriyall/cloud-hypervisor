@@ -2157,8 +2157,21 @@ impl Vmm {
                 );
             }
 
+            let disks_locked = vm
+                .try_lock_disks()
+                .inspect_err(|e| {
+                    error!(
+                        "Not resuming VM after failed migration, its disk locks could not be re-acquired: {}",
+                        flatten_error_chain_to_string(e)
+                    );
+                })
+                .is_ok();
+
             // A late failure may leave the VM paused.
-            if initial_vm_state == VmState::Running && vm.get_state() == VmState::Paused {
+            if disks_locked
+                && initial_vm_state == VmState::Running
+                && vm.get_state() == VmState::Paused
+            {
                 match vm.resume() {
                     Ok(_) => {
                         info!("Resumed VM successfully after failed migration");
@@ -2605,7 +2618,11 @@ impl RequestHandler for Vmm {
 
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
         match self.vm {
-            VmOwnership::Owned(ref mut vm) => vm.resume().map_err(VmError::Resume),
+            VmOwnership::Owned(ref mut vm) => {
+                // A failed migration may have left the disk locks released.
+                vm.try_lock_disks()?;
+                vm.resume().map_err(VmError::Resume)
+            }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
                 if self.vm_config.is_none() {
