@@ -1894,13 +1894,19 @@ impl Vmm {
         };
         let (_, complete_duration) = measure_ok(|| {
             // We might lose an ACK, but this is preferable to an inconsistent
-            // source VM or both VMs running. This is a known postcopy tradeoff.
-            *vm_moved_to_destination = true;
+            // source VM or both VMs running.
+            *vm_moved_to_destination = !send_data_migration.preserve_source;
             transport::send_request_expect_ok(
                 &mut socket,
                 complete_req,
                 MigratableError::MigrateSend(anyhow!("Error completing migration")),
             )
+            .inspect_err(|e| {
+                // Without a response, the destination may be running the VM.
+                if !matches!(e, MigratableError::MigrateSocket(_)) {
+                    *vm_moved_to_destination = false;
+                }
+            })
         })?;
 
         let ctx = ctx
@@ -2157,18 +2163,22 @@ impl Vmm {
                 );
             }
 
-            let disks_locked = vm
-                .try_lock_disks()
-                .inspect_err(|e| {
-                    error!(
-                        "Not resuming VM after failed migration, its disk locks could not be re-acquired: {}",
-                        flatten_error_chain_to_string(e)
-                    );
-                })
-                .is_ok();
+            let can_resume = if vm_moved_to_destination {
+                error!("Not resuming VM after failed migration, the destination may be running it");
+                false
+            } else {
+                vm.try_lock_disks()
+                    .inspect_err(|e| {
+                        error!(
+                            "Not resuming VM after failed migration, its disk locks could not be re-acquired: {}",
+                            flatten_error_chain_to_string(e)
+                        );
+                    })
+                    .is_ok()
+            };
 
             // A late failure may leave the VM paused.
-            if disks_locked
+            if can_resume
                 && initial_vm_state == VmState::Running
                 && vm.get_state() == VmState::Paused
             {
