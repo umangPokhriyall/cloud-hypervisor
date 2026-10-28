@@ -1180,6 +1180,15 @@ impl Vmm {
                     receive_data_migration,
                 )
                 .inspect_err(|_| {
+                    // The source may resume as soon as it reads the error response.
+                    if let Ok(mut vm) = self.vm.take_owned_or(VmError::VmNotCreated)
+                        && let Err(e) = vm.shutdown()
+                    {
+                        error!(
+                            "Failed shutting down the VM after failed receive migration: {}",
+                            flatten_error_chain_to_string(&e)
+                        );
+                    }
                     if let Err(response_err) = Response::error().write_to(&mut socket) {
                         warn!(
                             "Failed to send migration error response: {}",
