@@ -354,7 +354,13 @@ support for resume.
 
 If migration fails before the VM is transferred to the destination, Cloud
 Hypervisor makes every possible effort to resume the VM on the source and keep
-it usable.
+it usable. The source takes its disk locks again before it resumes the VM, and
+keeps it paused if another process holds them.
+
+If the destination sends no response to the final `Complete` request, the
+source cannot know whether the destination already resumed the VM, and keeps it
+paused. The management layer then resumes it with `ch-remote resume` or shuts
+it down.
 
 
 ## Version Compatibility
