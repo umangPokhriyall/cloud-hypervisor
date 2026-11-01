@@ -2021,6 +2021,24 @@ impl Vmm {
         }
     }
 
+    /// Applies `update` to a clone of the VM configuration and validates the
+    /// result, leaving the VM configuration itself unchanged.
+    fn validate_config_change(
+        &self,
+        update: impl FnOnce(&mut VmConfig),
+    ) -> result::Result<(), VmError> {
+        let mut config = self
+            .vm_config
+            .as_ref()
+            .ok_or(VmError::VmNotCreated)?
+            .lock()
+            .unwrap()
+            .clone();
+        update(&mut config);
+        config.validate().map_err(VmError::ConfigValidation)?;
+        Ok(())
+    }
+
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     fn vm_check_cpuid_compatibility(
         &self,
@@ -3016,12 +3034,9 @@ impl RequestHandler for Vmm {
     ) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+        self.validate_config_change(|config| {
             add_to_config(&mut config.devices, device_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        })?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3048,12 +3063,9 @@ impl RequestHandler for Vmm {
     ) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+        self.validate_config_change(|config| {
             add_to_config(&mut config.user_devices, device_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        })?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3100,12 +3112,7 @@ impl RequestHandler for Vmm {
     fn vm_add_disk(&mut self, disk_cfg: DiskConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-            add_to_config(&mut config.disks, disk_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        self.validate_config_change(|config| add_to_config(&mut config.disks, disk_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3129,12 +3136,7 @@ impl RequestHandler for Vmm {
     fn vm_add_fs(&mut self, fs_cfg: FsConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-            add_to_config(&mut config.fs, fs_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        self.validate_config_change(|config| add_to_config(&mut config.fs, fs_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3161,15 +3163,12 @@ impl RequestHandler for Vmm {
     ) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+        self.validate_config_change(|config| {
             add_to_config(
                 &mut config.generic_vhost_user,
                 generic_vhost_user_cfg.clone(),
             );
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        })?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3195,12 +3194,7 @@ impl RequestHandler for Vmm {
     fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-            add_to_config(&mut config.pmem, pmem_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        self.validate_config_change(|config| add_to_config(&mut config.pmem, pmem_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3224,12 +3218,7 @@ impl RequestHandler for Vmm {
     fn vm_add_net(&mut self, net_cfg: NetConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-            add_to_config(&mut config.net, net_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        self.validate_config_change(|config| add_to_config(&mut config.net, net_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3253,12 +3242,7 @@ impl RequestHandler for Vmm {
     fn vm_add_vdpa(&mut self, vdpa_cfg: VdpaConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-            add_to_config(&mut config.vdpa, vdpa_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
-        }
+        self.validate_config_change(|config| add_to_config(&mut config.vdpa, vdpa_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3280,19 +3264,13 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_add_vsock(&mut self, vsock_cfg: VsockConfig) -> result::Result<Option<Vec<u8>>, VmError> {
-        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+        let vm_config = self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        {
-            // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
-
-            if config.vsock.is_some() {
-                return Err(VmError::TooManyVsockDevices);
-            }
-
-            config.vsock = Some(vsock_cfg.clone());
-            config.validate().map_err(VmError::ConfigValidation)?;
+        if vm_config.lock().unwrap().vsock.is_some() {
+            return Err(VmError::TooManyVsockDevices);
         }
+
+        self.validate_config_change(|config| config.vsock = Some(vsock_cfg.clone()))?;
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
